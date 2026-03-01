@@ -1,0 +1,28 @@
+# Environment variables (API keys)
+.env
+
+# Input/output CSVs dropped in root
+*.csv
+
+# Client data (ICPs, output, logs, history)
+clients/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Cache data
+cache/
