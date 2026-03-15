@@ -65,6 +65,36 @@ python email_finder.py contacts.csv -c "Acme Corp" --enhanced
 
 Scrapes company homepages, contact pages, and team pages for published emails before generating pattern candidates. Uses those to prioritize likely formats. Optionally queries Google via ScrapingDog for additional matches.
 
+### Revalidate mode (re-verify existing emails)
+
+```bash
+python email_finder.py emails.csv --revalidate
+python email_finder.py emails.csv --revalidate -c "ClientName"
+```
+
+Takes a CSV that already has an `email` column and submits every address to Truelist for validation. Only emails that come back as `email_ok` are kept in the output. No name parsing, no candidate generation, no domain pre-checks -- just straight batch verification.
+
+Useful for cleaning stale lists, verifying emails sourced from other tools, or re-checking addresses before a campaign.
+
+Input CSV just needs an email column (header names are flexible: `email`, `email_address`, `e-mail`). Any extra columns in the CSV are preserved in the output.
+
+```csv
+email
+john@acme.com
+jane@example.io
+bad@nope.fake
+```
+
+Output keeps only valid emails and adds a `truelist_status` column:
+
+```csv
+email,truelist_status
+john@acme.com,email_ok
+jane@example.io,email_ok
+```
+
+With `-c`, the input CSV is moved into `clients/<name>/input/` and results are written to `clients/<name>/output/` just like the standard mode.
+
 ## Input CSV Format
 
 The CSV needs two columns (header names are flexible):
@@ -111,10 +141,10 @@ All client data lives under `clients/` which is gitignored. The `.gitignore` als
 ## CLI Reference
 
 ```
-usage: email_finder.py [-h] [-o OUTPUT] [-c CLIENT] [--enhanced] input_csv
+usage: email_finder.py [-h] [-o OUTPUT] [-c CLIENT] [--enhanced] [--revalidate] input_csv
 
 positional arguments:
-  input_csv             Path to input CSV with full_name and domain columns
+  input_csv             Path to input CSV
 
 options:
   -h, --help            show this help message and exit
@@ -123,6 +153,8 @@ options:
                          and logs/ folders.
   --enhanced            Enable website scraping to detect email patterns
                          before guessing
+  --revalidate          Re-validate existing emails from a CSV (expects an
+                         'email' column). Outputs only valid ones.
 ```
 
 ```
