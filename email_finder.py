@@ -10,13 +10,15 @@ Usage:
     python email_finder.py contacts.csv -c "Acme" --enhanced
     python email_finder.py contacts.csv                     # Legacy: read/write in place
     python email_finder.py contacts.csv -o results.csv      # Custom output path
+    python email_finder.py emails.csv --revalidate          # Re-validate existing emails
 
 With --client / -c the input CSV is moved into clients/<name>/input/ and
 results are written to clients/<name>/output/. The clients/ folder is
 gitignored so no client data is ever pushed to the repository.
 
-Fast mode:  pattern guess + Truelist only  (0 ScrapingDog credits)
-Enhanced:   scrape websites first, then guess + verify  (2-4 SD credits/domain)
+Fast mode:     pattern guess + Truelist only  (0 ScrapingDog credits)
+Enhanced:      scrape websites first, then guess + verify  (2-4 SD credits/domain)
+Revalidate:    submit existing emails to Truelist, keep only valid ones
 """
 
 import argparse
@@ -936,6 +938,125 @@ def find_emails(rows: list[dict], enhanced: bool = False) -> list[dict]:
 # CSV I/O & CLI
 # ══════════════════════════════════════════════════════════════
 
+def read_email_csv(path: str) -> tuple[list[dict], list[str], str]:
+    """Read a CSV containing an email column for revalidation.
+
+    Returns (rows, original_fieldnames, email_column_name).
+    """
+    rows = []
+    with open(path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+
+        email_col = None
+        for col in fieldnames:
+            cl = col.strip().lower()
+            if cl in ("email", "email_address", "e-mail", "emailaddress", "e_mail"):
+                email_col = col
+                break
+
+        if not email_col:
+            raise ValueError(
+                f"CSV must have an email column (email/email_address). Found: {fieldnames}"
+            )
+
+        for row in reader:
+            email = (row.get(email_col) or "").strip()
+            if email and "@" in email:
+                rows.append(dict(row))
+
+    return rows, fieldnames, email_col
+
+
+def revalidate_emails(rows: list[dict], email_col: str) -> list[dict]:
+    """Submit existing emails to Truelist and tag each with its validation status.
+
+    Only emails that come back as email_ok are marked 'valid'.
+    """
+    if not TRUELIST_API_KEY:
+        raise ValueError(
+            "TRUELIST_API_KEY not set. Add it to your .env file.\n"
+            "  Get a free key at https://truelist.io"
+        )
+
+    emails = [row[email_col].strip().lower() for row in rows if row.get(email_col)]
+    unique_emails = list(dict.fromkeys(emails))
+
+    print(f"\n{'='*60}")
+    print(f"  REVALIDATE — {len(unique_emails)} unique emails")
+    print(f"{'='*60}\n")
+
+    delete_all_batches()
+
+    MAX_RETRIES = 2
+    results = None
+    for attempt in range(MAX_RETRIES + 1):
+        if attempt > 0:
+            print(f"\n  Retry {attempt}/{MAX_RETRIES}: waiting 60s...")
+            time.sleep(60)
+            delete_all_batches()
+
+        batch_id = submit_batch(unique_emails)
+        if not batch_id:
+            continue
+        results = poll_batch(batch_id)
+        if results:
+            break
+
+    if not results:
+        print("  All Truelist attempts failed. No emails validated.")
+        for row in rows:
+            row["truelist_status"] = "error"
+        return rows
+
+    valid_count = 0
+    invalid_count = 0
+    print(f"\n  Mapping results...")
+    for row in rows:
+        email = row[email_col].strip().lower()
+        result = results.get(email, {})
+        status = result.get("status", "unknown")
+        passed = result.get("passed", False)
+        row["truelist_status"] = status
+
+        if passed:
+            valid_count += 1
+        else:
+            invalid_count += 1
+
+    print(f"\n{'='*60}")
+    print(f"  RESULTS")
+    print(f"{'='*60}")
+    print(f"    Valid (email_ok): {valid_count}")
+    print(f"    Invalid/Other:   {invalid_count}")
+    print(f"    Total:           {len(rows)}")
+    print()
+
+    return rows
+
+
+def write_revalidate_csv(
+    rows: list[dict], fieldnames: list[str], email_col: str,
+    path: str, valid_only: bool = True,
+) -> None:
+    """Write revalidation results. By default only keeps valid emails."""
+    out_fields = fieldnames + (["truelist_status"] if "truelist_status" not in fieldnames else [])
+    output_rows = [r for r in rows if r.get("truelist_status") in PASS_STATUSES] if valid_only else rows
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=out_fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in output_rows:
+            writer.writerow({col: row.get(col, "") for col in out_fields})
+
+    kept = len(output_rows)
+    total = len(rows)
+    if valid_only:
+        print(f"  Output written to: {path}  ({kept}/{total} valid emails kept)")
+    else:
+        print(f"  Output written to: {path}  ({total} emails)")
+
+
 def read_csv(path: str) -> list[dict]:
     """Read input CSV. Expects columns: full_name, domain."""
     rows = []
@@ -1012,6 +1133,7 @@ def main():
             '  python email_finder.py contacts.csv -c "Acme" --enhanced\n'
             "  python email_finder.py contacts.csv\n"
             "  python email_finder.py contacts.csv -o results.csv\n"
+            "  python email_finder.py emails.csv --revalidate\n"
             "\n"
             "Client mode (-c / --client):\n"
             "  Moves the input CSV into clients/<name>/input/, writes\n"
@@ -1040,6 +1162,11 @@ def main():
         "--enhanced", action="store_true",
         help="Enable website scraping to detect email patterns before guessing",
     )
+    parser.add_argument(
+        "--revalidate", action="store_true",
+        help="Re-validate existing emails from a CSV (expects an 'email' column). "
+             "Submits all emails to Truelist and outputs only valid ones.",
+    )
 
     args = parser.parse_args()
 
@@ -1053,6 +1180,50 @@ def main():
 
     tee: _TeeWriter | None = None
 
+    # ── Revalidate mode ──────────────────────────────────────
+    if args.revalidate:
+        output_path = args.output or f"{base_no_ext}_validated{ext}"
+        log_path = None
+
+        if args.client:
+            safe_name = _sanitize_client_name(args.client)
+            client_dir = os.path.join("clients", safe_name)
+            input_dir = os.path.join(client_dir, "input")
+            output_dir = os.path.join(client_dir, "output")
+            logs_dir = os.path.join(client_dir, "logs")
+            os.makedirs(input_dir, exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(logs_dir, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(logs_dir, f"revalidate_{timestamp}.log")
+            tee = _TeeWriter(log_path)
+            sys.stdout = tee
+            output_path = args.output or os.path.join(output_dir, f"{base_no_ext}_validated{ext}")
+
+        try:
+            rows, fieldnames, email_col = read_email_csv(input_path)
+            if not rows:
+                print("No valid emails found in input CSV.")
+                return
+
+            if args.client:
+                dest = os.path.join(input_dir, csv_basename)
+                if os.path.abspath(input_path) != os.path.abspath(dest):
+                    shutil.move(input_path, dest)
+                    print(f"  Moved input CSV -> {dest}")
+                print(f"  Client: {args.client}")
+
+            print(f"  Loaded {len(rows)} emails from {csv_basename}")
+            rows = revalidate_emails(rows, email_col)
+            write_revalidate_csv(rows, fieldnames, email_col, output_path, valid_only=True)
+        finally:
+            if tee:
+                print(f"  Log saved to: {log_path}")
+                tee.close()
+        return
+
+    # ── Standard find-emails mode ────────────────────────────
     if args.client:
         safe_name = _sanitize_client_name(args.client)
         client_dir = os.path.join("clients", safe_name)
